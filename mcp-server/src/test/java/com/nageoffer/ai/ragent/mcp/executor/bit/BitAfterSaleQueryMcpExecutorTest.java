@@ -36,9 +36,9 @@ class BitAfterSaleQueryMcpExecutorTest {
     void legendPrecedesRowsAndAppearsOnce() {
         String result = BitAfterSaleQueryMcpExecutor.buildResult(List.of(row("AS1", "处理中"), row("AS2", "已完成")));
 
-        String[] lines = result.split("\n");
-        assertEquals("【售后单 2 张】", lines[0]);
-        assertEquals(BitAfterSaleQueryMcpExecutor.STATUS_LEGEND, lines[1]);
+        List<String> lines = result.lines().toList();
+        assertEquals("【售后单 2 张】", lines.get(0));
+        assertEquals(BitAfterSaleQueryMcpExecutor.STATUS_LEGEND, lines.get(1));
         assertEquals(result.indexOf("状态说明"), result.lastIndexOf("状态说明"));
         assertTrue(result.contains("类型: 退货退款 | 当前状态: 处理中"));
     }

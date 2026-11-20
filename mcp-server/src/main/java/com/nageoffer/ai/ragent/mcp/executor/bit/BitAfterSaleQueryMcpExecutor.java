@@ -52,20 +52,28 @@ public class BitAfterSaleQueryMcpExecutor {
     private static final String TOOL_ID = "query_after_sale";
 
     /**
+     * 供聊天终答补充状态说明，与 Agent 读取的 MCP 响应元数据键一致
+     */
+    private static final String STATUS_LEGEND_META_KEY = "com.nageoffer.ragent/afterSaleStatusLegend";
+
+    /**
      * 单个用户的售后单不会多，这个上限只是防御性截断
      */
     private static final int MAX_ROWS = 20;
 
     /**
-     * 状态值的含义随结果一起给：只给「处理中」三个字，模型会把它读成仍在审核，或断言退款还没发起
-     * <p>
-     * 与 apply_after_sale 写入的状态、知识库里的售后流程一致，改状态流转时三处一起改
+     * 状态说明同时用于模型读取的正文和终答展示，避免把「处理中」误解为仍在审核或某个具体退款节点
      */
     static final String STATUS_LEGEND = "状态说明：待处理 = 等待人工审核；处理中 = 审核已通过，"
             + "寄回、验收或检测、退款发起都在这一状态内，系统不区分；已完成 = 处理结束";
 
     private final AfterSaleMapper afterSaleMapper;
 
+    /**
+     * 注册按登录用户查询的只读售后工具，查到售后单时同时提供状态说明
+     *
+     * @return 售后单查询的 MCP 工具定义及调用处理器
+     */
     @Bean
     public McpServerFeatures.SyncToolSpecification queryAfterSaleToolSpecification() {
         return McpServerFeatures.SyncToolSpecification.builder()
@@ -90,6 +98,9 @@ public class BitAfterSaleQueryMcpExecutor {
                 .build();
     }
 
+    /**
+     * 校验登录标识，按售后单号和订单号筛选名下记录。查到记录时才附上供终答使用的状态说明
+     */
     private CallToolResult handleCall(CallToolRequest request) {
         long startMs = System.currentTimeMillis();
         String userId = McpToolResults.userId(request);
@@ -106,7 +117,11 @@ public class BitAfterSaleQueryMcpExecutor {
             log.info("MCP 工具调用完成, toolId={}, afterSaleNo={}, orderNo={}, matched={}, elapsed={}ms",
                     TOOL_ID, afterSaleNo, orderNo, rows.size(), System.currentTimeMillis() - startMs);
             if (!rows.isEmpty()) {
-                return McpToolResults.success(buildResult(rows));
+                return CallToolResult.builder()
+                        .addTextContent(buildResult(rows))
+                        .isError(false)
+                        .meta(Map.of(STATUS_LEGEND_META_KEY, STATUS_LEGEND))
+                        .build();
             }
             if (afterSaleNo != null) {
                 return BitToolSupport.notFound("售后单 " + afterSaleNo);
@@ -125,10 +140,13 @@ public class BitAfterSaleQueryMcpExecutor {
         return afterSaleMapper.selectDetails(userId, afterSaleNo, orderNo, MAX_ROWS);
     }
 
+    /**
+     * 将状态说明放在明细列表前，只写一次，并保留各售后单的原始状态值
+     */
     static String buildResult(List<AfterSaleDetailResult> rows) {
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("【售后单 %d 张】%n", rows.size()));
-        sb.append(STATUS_LEGEND).append('\n');
+        sb.append(STATUS_LEGEND).append(System.lineSeparator());
         for (AfterSaleDetailResult row : rows) {
             sb.append(String.format("%n售后单号: %s%n", row.getAfterSaleNo()));
             sb.append(String.format("对应订单: %s%n", row.getOrderNo()));

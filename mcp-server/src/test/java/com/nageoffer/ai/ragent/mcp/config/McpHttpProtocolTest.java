@@ -17,9 +17,12 @@
 
 package com.nageoffer.ai.ragent.mcp.config;
 
+import com.nageoffer.ai.ragent.mcp.dao.mapper.AfterSaleMapper;
 import com.nageoffer.ai.ragent.mcp.dao.mapper.OrderItemMapper;
 import com.nageoffer.ai.ragent.mcp.dao.mapper.OrderMapper;
+import com.nageoffer.ai.ragent.mcp.dao.result.AfterSaleDetailResult;
 import com.nageoffer.ai.ragent.mcp.executor.McpToolResults;
+import com.nageoffer.ai.ragent.mcp.executor.bit.BitAfterSaleQueryMcpExecutor;
 import com.nageoffer.ai.ragent.mcp.executor.bit.BitOrderQueryMcpExecutor;
 import com.nageoffer.ai.ragent.mcp.executor.common.CurrentDateMcpExecutor;
 import io.agentscope.core.tool.mcp.McpClientBuilder;
@@ -37,11 +40,13 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 @SpringBootTest(classes = McpHttpProtocolTest.Application.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
@@ -53,6 +58,9 @@ class McpHttpProtocolTest {
 
     @Autowired
     private OrderMapper orderMapper;
+
+    @Autowired
+    private AfterSaleMapper afterSaleMapper;
 
     @Test
     void shouldDiscoverAndCallToolsWithUserMetaOverHttp() {
@@ -83,6 +91,40 @@ class McpHttpProtocolTest {
         }
     }
 
+    /**
+     * 查到售后单时，AgentScope 客户端同时收到模型正文和供终答使用的同一份状态说明
+     */
+    @Test
+    void shouldReturnAfterSaleLegendInTextAndMetadataOverHttp() {
+        AfterSaleDetailResult row = new AfterSaleDetailResult();
+        row.setAfterSaleNo("AS-1");
+        row.setOrderNo("NO-1");
+        row.setType("退货退款");
+        row.setStatus("处理中");
+        when(afterSaleMapper.selectDetails("user-1", "AS-1", null, 20)).thenReturn(List.of(row));
+
+        try (var client = McpClientBuilder.create("ragent-test")
+                .streamableHttpTransport("http://127.0.0.1:" + port + "/mcp")
+                .buildSync()) {
+            client.initialize().block(Duration.ofSeconds(5));
+            Map<String, Object> meta = Map.of(McpToolResults.META_USER_ID, "user-1");
+            CallToolResult found = client.callTool("query_after_sale", Map.of("afterSaleNo", "AS-1"), meta)
+                    .block(Duration.ofSeconds(5));
+            assertThat(found.isError()).isFalse();
+            String text = ((TextContent) found.content().get(0)).text();
+            String legend = text.lines().skip(1).findFirst().orElseThrow();
+            assertThat(text).contains("当前状态: 处理中");
+            assertThat(legend).contains("待处理 = 等待人工审核", "处理中 = 审核已通过", "退款发起", "已完成 = 处理结束");
+            assertThat(found.meta()).containsEntry("com.nageoffer.ragent/afterSaleStatusLegend", legend);
+
+            CallToolResult missing = client.callTool("query_after_sale", Map.of("afterSaleNo", "AS-2"), meta)
+                    .block(Duration.ofSeconds(5));
+            assertThat(missing.isError()).isFalse();
+            assertThat(((TextContent) missing.content().get(0)).text()).contains("未找到售后单 AS-2");
+            assertThat(missing.meta()).isNullOrEmpty();
+        }
+    }
+
     @SpringBootConfiguration
     @EnableAutoConfiguration(exclude = DataSourceAutoConfiguration.class)
     @Import(McpServerConfig.class)
@@ -99,6 +141,11 @@ class McpHttpProtocolTest {
         }
 
         @Bean
+        AfterSaleMapper afterSaleMapper() {
+            return mock(AfterSaleMapper.class);
+        }
+
+        @Bean
         McpServerFeatures.SyncToolSpecification currentDateToolSpecification() {
             return new CurrentDateMcpExecutor().currentDateToolSpecification();
         }
@@ -107,6 +154,11 @@ class McpHttpProtocolTest {
         McpServerFeatures.SyncToolSpecification queryOrderToolSpecification(
                 OrderMapper orderMapper, OrderItemMapper orderItemMapper) {
             return new BitOrderQueryMcpExecutor(orderMapper, orderItemMapper).queryOrderToolSpecification();
+        }
+
+        @Bean
+        McpServerFeatures.SyncToolSpecification queryAfterSaleToolSpecification(AfterSaleMapper afterSaleMapper) {
+            return new BitAfterSaleQueryMcpExecutor(afterSaleMapper).queryAfterSaleToolSpecification();
         }
     }
 }

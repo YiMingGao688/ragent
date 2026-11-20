@@ -35,6 +35,11 @@ public final class AgentMcpMeta {
      */
     public static final String USER_ID_KEY = "com.nageoffer.ragent/userId";
 
+    /**
+     * 售后查询结果中供终答展示的状态说明，与 MCP Server 响应键一致
+     */
+    public static final String AFTER_SALE_STATUS_LEGEND_KEY = "com.nageoffer.ragent/afterSaleStatusLegend";
+
     public static Map<String, Object> ofUser(String userId) {
         return StrUtil.isBlank(userId)
                 ? Map.of()

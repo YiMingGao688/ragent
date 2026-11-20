@@ -32,6 +32,7 @@ import com.nageoffer.ai.ragent.agent.enums.AgentMessageStatus;
 import com.nageoffer.ai.ragent.agent.enums.AgentSSEEventType;
 import com.nageoffer.ai.ragent.agent.enums.AgentToolStatus;
 import com.nageoffer.ai.ragent.agent.service.AgentConversationService;
+import com.nageoffer.ai.ragent.agent.tool.AgentMcpMeta;
 import com.nageoffer.ai.ragent.agent.tool.AgentToolCatalog.ResolvedCatalog;
 import com.nageoffer.ai.ragent.agent.tool.AgentToolExecutionFacts;
 import com.nageoffer.ai.ragent.agent.tool.AgentToolExecutionFacts.ToolBatchFact;
@@ -52,6 +53,7 @@ import io.agentscope.core.event.ToolResultTextDeltaEvent;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.message.ToolResultState;
 import io.agentscope.core.message.ToolUseBlock;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -173,6 +175,10 @@ public class AgentStreamEventBridge {
         flushSealedTextBlocks();
     }
 
+    /**
+     * 正常收尾时以流式正文为准，必要时补发非流式终答和本轮成功查询的售后状态说明。
+     * 将展示的正文和文本块一同保存。若工具仍待确认，先结算确认消息，终答由续跑处理。
+     */
     public void onComplete() {
         // 被取消的轮次框架也会触发 onComplete，由 finishCancelledStream 统一收尾
         if (runHandle.isCancelled()) {
@@ -184,25 +190,47 @@ public class AgentStreamEventBridge {
                 return;
             }
             String content;
-            boolean resend;
+            String completionDelta;
             synchronized (stateLock) {
                 String streamed = textOf(TextKind.ANSWER);
                 // 优先用流式增量，为空时回退到终答消息
                 content = StrUtil.isNotBlank(streamed) ? streamed : fallbackText;
-                // 非流式场景没有增量，块和增量都要一次性补发
-                resend = streamed.isEmpty() && StrUtil.isNotBlank(content);
-                if (resend) {
-                    appendTextBlock(TextKind.ANSWER, content, false);
+                String legendDelta = afterSaleLegendDelta(content);
+                // 非流式终答和补充说明都要同步写入文本块并发送增量，保证刷新前后正文一致
+                completionDelta = (streamed.isEmpty() && StrUtil.isNotBlank(content) ? content : "") + legendDelta;
+                if (!completionDelta.isEmpty()) {
+                    appendTextBlock(TextKind.ANSWER, completionDelta, false);
                 }
+                content += legendDelta;
             }
-            if (resend) {
+            if (!completionDelta.isEmpty()) {
                 sender.sendEvent(AgentSSEEventType.MESSAGE.value(),
-                        new AgentMessageDelta(TextKind.ANSWER.kind, content));
+                        new AgentMessageDelta(TextKind.ANSWER.kind, completionDelta));
             }
             String messageId = settleAndPersistMessage(content, AgentMessageStatus.NORMAL);
             sendTerminal(AgentSSEEventType.FINISH,
                     new AgentCompletionPayload(messageId, title, AgentMessageStatus.NORMAL.name(), facts.settleRun()));
         });
+    }
+
+    /**
+     * 从本轮成功工具的返回元数据取状态说明。多次查询使用相同说明，终答已包含的原文无需补发。
+     * 调用方需持有 stateLock。
+     */
+    private String afterSaleLegendDelta(String content) {
+        Set<String> legends = new LinkedHashSet<>();
+        for (AgentBlock block : blocks) {
+            if (!AgentBlock.KIND_TOOL.equals(block.getKind())) {
+                continue;
+            }
+            ToolResultBlock result = facts.toolFact(block.getToolCallId()).result();
+            if (result != null && result.getState() == ToolResultState.SUCCESS
+                    && result.getMetadata().get(AgentMcpMeta.AFTER_SALE_STATUS_LEGEND_KEY) instanceof String legend
+                    && !content.contains(legend)) {
+                legends.add(legend);
+            }
+        }
+        return legends.isEmpty() ? "" : (StrUtil.isBlank(content) ? "" : "\n\n") + String.join("\n\n", legends);
     }
 
     public void onError(Throwable throwable) {

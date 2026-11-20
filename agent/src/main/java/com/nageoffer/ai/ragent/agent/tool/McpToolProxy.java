@@ -34,9 +34,11 @@ import io.agentscope.core.tool.mcp.McpClientWrapper;
 import io.agentscope.core.tool.mcp.McpContentConverter;
 import io.agentscope.core.tool.mcp.McpMeta;
 import io.agentscope.core.tool.mcp.McpTool;
+import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
 import lombok.extern.slf4j.Slf4j;
 import reactor.core.publisher.Mono;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -71,6 +73,12 @@ public class McpToolProxy extends McpTool {
         });
     }
 
+    /**
+     * 检查工具是否已解锁，调用远端工具并保留模型正文和售后状态说明。调用异常转为失败或中断结果
+     *
+     * @param param 工具入参及本轮运行上下文
+     * @return AgentScope 工具结果
+     */
     @Override
     public Mono<ToolResultBlock> callAsync(ToolCallParam param) {
         Optional<RuntimeContext> context = Optional.ofNullable(param.getRuntimeContext());
@@ -94,9 +102,7 @@ public class McpToolProxy extends McpTool {
                     .map(McpMeta::entries)
                     .orElseGet(Map::of);
             return Mono.defer(() -> client.callTool(getName(), param.getInput(), meta))
-                    .map(McpContentConverter::convertCallToolResult)
-                    .map(result -> result.getState() == ToolResultState.RUNNING
-                            ? result.withState(ToolResultState.SUCCESS) : result)
+                    .map(McpToolProxy::convertResult)
                     .onErrorResume(e -> {
                         if (TaskCancellation.isCancellation(e)) {
                             return Mono.just(ToolResultBlock.text("用户已停止，本次工具调用未完成")
@@ -106,6 +112,23 @@ public class McpToolProxy extends McpTool {
                         return Mono.just(ToolResultBlock.error(CALL_FAILED_MESSAGE));
                     });
         });
+    }
+
+    /**
+     * AgentScope 转换正文时会丢弃 MCP 响应的 {@code _meta}，单独保留成功查询附带的状态说明供终答使用
+     */
+    private static ToolResultBlock convertResult(CallToolResult response) {
+        ToolResultBlock converted = McpContentConverter.convertCallToolResult(response);
+        ToolResultBlock result = converted.getState() == ToolResultState.RUNNING
+                ? converted.withState(ToolResultState.SUCCESS) : converted;
+        if (result.getState() != ToolResultState.SUCCESS || response.meta() == null
+                || !(response.meta().get(AgentMcpMeta.AFTER_SALE_STATUS_LEGEND_KEY) instanceof String legend)
+                || legend.isBlank()) {
+            return result;
+        }
+        Map<String, Object> metadata = new HashMap<>(result.getMetadata());
+        metadata.put(AgentMcpMeta.AFTER_SALE_STATUS_LEGEND_KEY, legend);
+        return new ToolResultBlock(result.getId(), result.getName(), result.getOutput(), metadata, result.getState());
     }
 
     private boolean isMasked(RuntimeContext context) {

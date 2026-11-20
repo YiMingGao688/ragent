@@ -24,6 +24,7 @@ import com.nageoffer.ai.ragent.agent.dto.AgentMessageDelta;
 import com.nageoffer.ai.ragent.agent.dto.AgentTextBlockSeal;
 import com.nageoffer.ai.ragent.agent.dto.AgentToolProgress;
 import com.nageoffer.ai.ragent.agent.service.AgentConversationService;
+import com.nageoffer.ai.ragent.agent.tool.AgentMcpMeta;
 import com.nageoffer.ai.ragent.agent.tool.AgentToolCatalog.McpToolBinding;
 import com.nageoffer.ai.ragent.agent.tool.AgentToolCatalog.ResolvedCatalog;
 import com.nageoffer.ai.ragent.agent.tool.AgentMcpClients.RemoteTool;
@@ -51,6 +52,8 @@ import io.modelcontextprotocol.spec.McpSchema.JsonSchema;
 import io.modelcontextprotocol.spec.McpSchema.Tool;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
@@ -209,6 +212,44 @@ class AgentStreamEventBridgeTest {
         // 无起止则不发封口帧
         verify(sender, never()).sendEvent(eq("block"), any());
         verify(sender).sendEvent("message", new AgentMessageDelta("answer", "一次性给出的终答"));
+    }
+
+    /**
+     * 同轮多次查询只补一份状态说明，终答原样带出时无需补发，流式与历史正文保持一致
+     */
+    @ParameterizedTest
+    @CsvSource({"true, false", "false, false", "true, true"})
+    void shouldShowAfterSaleLegendOnceInLiveAndPersistedAnswer(boolean streamed, boolean alreadyIncluded) {
+        String toolName = "query_after_sale";
+        String legend = "状态说明：待处理 = 等待人工审核；处理中 = 审核已通过；已完成 = 处理结束";
+        for (String callId : List.of("call-1", "call-2")) {
+            bridge.onEvent(new ToolCallStartEvent(REASON_ID, callId, toolName));
+            bridge.onEvent(new ToolResultStartEvent(ACT_ID, callId, toolName));
+            facts.markReturned(callId, ToolResultBlock.builder()
+                    .name(toolName)
+                    .state(ToolResultState.SUCCESS)
+                    .metadata(Map.of(AgentMcpMeta.AFTER_SALE_STATUS_LEGEND_KEY, legend))
+                    .build());
+            bridge.onEvent(new ToolResultEndEvent(ACT_ID, callId, toolName, ToolResultState.SUCCESS));
+        }
+
+        String answer = "售后单 AS-1 当前状态为处理中。";
+        String expected = answer + "\n\n" + legend;
+        String modelText = alreadyIncluded ? expected : answer;
+        if (streamed) {
+            bridge.onEvent(new TextBlockDeltaEvent(REASON_ID, "answer-1", modelText));
+        } else {
+            bridge.onEvent(new AgentResultEvent(Msg.builder().role(MsgRole.ASSISTANT).textContent(modelText).build()));
+        }
+        bridge.onComplete();
+
+        ArgumentCaptor<AgentMessageDelta> deltas = ArgumentCaptor.forClass(AgentMessageDelta.class);
+        verify(sender, times(streamed && !alreadyIncluded ? 2 : 1)).sendEvent(eq("message"), deltas.capture());
+        assertThat(deltas.getAllValues().stream().map(AgentMessageDelta::delta).reduce("", String::concat))
+                .isEqualTo(expected);
+        assertThat(capturedContent()).isEqualTo(expected);
+        assertThat(capturedBlocks()).filteredOn(block -> AgentBlock.KIND_ANSWER.equals(block.getKind()))
+                .extracting(AgentBlock::getText).containsExactly(expected);
     }
 
     @Test

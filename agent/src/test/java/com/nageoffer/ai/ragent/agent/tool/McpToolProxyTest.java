@@ -53,7 +53,7 @@ import static org.mockito.Mockito.when;
 
 class McpToolProxyTest {
 
-    private static final String TOOL_ID = "query_order";
+    private static final String TOOL_ID = "query_after_sale";
     private McpClientWrapper client;
     private McpToolProxy tool;
 
@@ -63,17 +63,17 @@ class McpToolProxyTest {
         when(client.getName()).thenReturn("default");
         Tool definition = Tool.builder()
                 .name(TOOL_ID)
-                .description("查询订单")
+                .description("查询售后进度")
                 .inputSchema(new JsonSchema("object", Map.of(), List.of(), null, null, null))
                 .build();
-        tool = new McpToolProxy(McpToolBinding.of(TOOL_ID, "订单查询", "查询订单", false,
+        tool = new McpToolProxy(McpToolBinding.of(TOOL_ID, "售后进度查询", "查询售后进度", false,
                 new RemoteTool(definition, client)));
     }
 
     @Test
     void shouldPassIdentityThroughAgentScopeMeta() {
         when(client.callTool(eq(TOOL_ID), anyMap(), anyMap())).thenReturn(Mono.just(CallToolResult.builder()
-                .content(List.of(new TextContent("订单查询结果")))
+                .content(List.of(new TextContent("售后查询结果")))
                 .isError(false)
                 .build()));
         RuntimeContext context = RuntimeContext.builder()
@@ -86,6 +86,27 @@ class McpToolProxyTest {
         ArgumentCaptor<Map<String, Object>> meta = ArgumentCaptor.forClass(Map.class);
         verify(client).callTool(eq(TOOL_ID), anyMap(), meta.capture());
         assertThat(meta.getValue()).containsEntry(AgentMcpMeta.USER_ID_KEY, "2001");
+    }
+
+    /**
+     * 状态说明既留在模型所读的正文里，也以元数据交给终答组装
+     */
+    @Test
+    void shouldPreserveAfterSaleLegendInTextAndMetadata() {
+        String legend = "状态说明：待处理 = 等待人工审核；处理中 = 审核已通过；已完成 = 处理结束";
+        String text = "【售后单 1 张】\n" + legend + "\n\n售后单号: AS-1";
+        when(client.callTool(eq(TOOL_ID), anyMap(), anyMap())).thenReturn(Mono.just(CallToolResult.builder()
+                .addTextContent(text)
+                .isError(false)
+                .meta(Map.of(AgentMcpMeta.AFTER_SALE_STATUS_LEGEND_KEY, legend))
+                .build()));
+
+        ToolResultBlock result = Objects.requireNonNull(tool.callAsync(param(RuntimeContext.builder().build())).block());
+
+        assertThat(result.getState()).isEqualTo(ToolResultState.SUCCESS);
+        assertThat(result.getOutput()).singleElement().isInstanceOfSatisfying(TextBlock.class,
+                block -> assertThat(block.getText()).isEqualTo(text));
+        assertThat(result.getMetadata()).containsEntry(AgentMcpMeta.AFTER_SALE_STATUS_LEGEND_KEY, legend);
     }
 
     @Test
